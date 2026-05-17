@@ -137,10 +137,12 @@ class MCDiscordBot(commands.Bot):
             logger.exception("Docker events loop terminated")
 
     def _handle_log_line(self, line: str):
-        logger.debug(line.strip())
+        line = line.rstrip()
+        logger.debug(line)
         event = parse_player_event(line)
         if event:
             player, kind = event
+            logger.info(f"Detected player {kind}: {player}")
             if kind == "join":
                 asyncio.run_coroutine_threadsafe(self._notify_channel(f"🟢 `{player}` がサーバーに参加しました"), self.loop)
             else:
@@ -176,13 +178,25 @@ class MCDiscordBot(commands.Bot):
 
 
 def parse_player_event(line: str) -> Optional[tuple[str, str]]:
-    joined = re.search(r"([^\s]+) joined the game", line)
+    normalized = line.strip()
+
+    # Vanilla / Paper style
+    joined = re.search(r"(?:\] )?(?:<[^>]+> )?([^\s]+) joined the game", normalized)
     if joined:
         return joined.group(1), "join"
 
-    left = re.search(r"([^\s]+) left the game", line)
+    left = re.search(r"(?:\] )?(?:<[^>]+> )?([^\s]+) left the game", normalized)
     if left:
         return left.group(1), "leave"
+
+    # Some server variants emit login/logout related lines instead of the exact vanilla message.
+    login = re.search(r"(?:\] )?(?:<[^>]+> )?([^\s]+) logged in", normalized, re.IGNORECASE)
+    if login:
+        return login.group(1), "join"
+
+    logout = re.search(r"(?:\] )?(?:<[^>]+> )?([^\s]+) lost connection", normalized, re.IGNORECASE)
+    if logout:
+        return logout.group(1), "leave"
 
     return None
 
