@@ -39,13 +39,13 @@ class MCDiscordBot(commands.Bot):
         else:
             await self.tree.sync()
 
-        # start background tasks
-        if not status_updater.is_running():
-            status_updater.start()
+        # background task starts after gateway is ready (on_ready)
 
     async def on_ready(self):
         logger.info(f"Logged in as {self.user}")
         self.loop_ready.set()
+        if not status_updater.is_running():
+            status_updater.start()
         # obtain container handle
         try:
             self.container = self.docker_client.containers.get(Config.CONTAINER_NAME)
@@ -251,6 +251,9 @@ async def mc_status(interaction: discord.Interaction):
 @tasks.loop(seconds=Config.STATUS_UPDATE_INTERVAL)
 async def status_updater():
     # update bot activity
+    if not bot.is_ready() or bot.ws is None:
+        return
+
     try:
         container = bot.docker_client.containers.get(Config.CONTAINER_NAME)
         status = container.status
