@@ -40,7 +40,8 @@ class MCDiscordBot(commands.Bot):
             await self.tree.sync()
 
         # start background tasks
-        self.status_updater.start()
+        if not status_updater.is_running():
+            status_updater.start()
 
     async def on_ready(self):
         logger.info(f"Logged in as {self.user}")
