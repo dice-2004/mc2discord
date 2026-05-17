@@ -73,7 +73,11 @@ class MCDiscordBot(commands.Bot):
                         time.sleep(10)
                         continue
 
-                logs = self.container.logs(stream=True, follow=True, since=0)
+                try:
+                    since_ts = int(time.time())
+                    logs = self.container.logs(stream=True, follow=True, since=since_ts)
+                except docker.errors.InvalidArgument:
+                    logs = self.container.logs(stream=True, follow=True)
                 for raw in logs:
                     try:
                         line = raw.decode('utf-8', errors='ignore')
