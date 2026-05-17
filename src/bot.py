@@ -7,6 +7,7 @@ from typing import Optional
 from typing import Tuple, Optional
 
 import docker
+from concurrent.futures import ProcessPoolExecutor
 from mcrcon import MCRcon
 import discord
 from discord import app_commands
@@ -60,6 +61,10 @@ class MCDiscordBot(commands.Bot):
             self.start_log_thread()
         except Exception as e:
             logger.warning(f"Could not get container {Config.CONTAINER_NAME}: {e}")
+
+
+# process pool for RCON calls (avoid signal() in non-main threads)
+process_pool = ProcessPoolExecutor(max_workers=2)
 
     def start_log_thread(self):
         if self.log_thread and self.log_thread.is_alive():
@@ -281,9 +286,10 @@ async def mc_stop(interaction: discord.Interaction):
         if container.status != 'running':
             await interaction.followup.send("サーバーは稼働していません。", ephemeral=True)
             return
-        # run save-all via RCON (offload blocking call)
+        # run save-all via RCON (offload blocking call to separate process)
         try:
-            await asyncio.to_thread(rcon_execute_with_retries, 'save-all')
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(process_pool, rcon_execute_with_retries, 'save-all')
         except Exception as e:
             logger.warning(f"RCON save-all failed: {e}")
         container.stop()
@@ -302,8 +308,9 @@ async def mc_restart(interaction: discord.Interaction):
         container = bot.docker_client.containers.get(Config.CONTAINER_NAME)
         if container.status == 'running':
             try:
-                await asyncio.to_thread(rcon_execute_with_retries, 'say サーバーを再起動します。数秒後に切断されます。')
-                await asyncio.to_thread(rcon_execute_with_retries, 'save-all')
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(process_pool, rcon_execute_with_retries, 'say サーバーを再起動します。数秒後に切断されます。')
+                await loop.run_in_executor(process_pool, rcon_execute_with_retries, 'save-all')
             except Exception as e:
                 logger.warning(f"RCON announce/save failed: {e}")
         container.restart()
@@ -345,7 +352,8 @@ async def mc_status(interaction: discord.Interaction):
     player_list = "(不明)"
     player_count = 0
     try:
-        r = await asyncio.to_thread(rcon_execute_with_retries, 'list', True)
+        loop = asyncio.get_running_loop()
+        r = await loop.run_in_executor(process_pool, rcon_execute_with_retries, 'list', True)
         # parse: "There are X of a max of Y players online: name1, name2"
         mres = re.search(r"There are (\d+) of a max of (\d+) players online:?\s*(.*)", r)
         if mres:
@@ -379,7 +387,8 @@ async def status_updater():
 
     player_count = None
     try:
-        r = await asyncio.to_thread(rcon_execute_with_retries, 'list', True)
+        loop = asyncio.get_running_loop()
+        r = await loop.run_in_executor(process_pool, rcon_execute_with_retries, 'list', True)
         mres = re.search(r"There are (\d+) of a max of (\d+) players online", r)
         if mres:
             player_count = int(mres.group(1))
