@@ -28,6 +28,7 @@ class MCDiscordBot(commands.Bot):
         self.docker_client = docker.from_env()
         self.container = None
         self.log_thread: Optional[threading.Thread] = None
+        self.event_thread: Optional[threading.Thread] = None
         self.loop_ready = asyncio.Event()
 
     async def setup_hook(self):
@@ -46,6 +47,11 @@ class MCDiscordBot(commands.Bot):
         self.loop_ready.set()
         if not status_updater.is_running():
             status_updater.start()
+        # start docker events watcher
+        if not (self.event_thread and self.event_thread.is_alive()):
+            et = threading.Thread(target=self._docker_events_loop, daemon=True)
+            et.start()
+            self.event_thread = et
         # obtain container handle
         try:
             self.container = self.docker_client.containers.get(Config.CONTAINER_NAME)
@@ -64,15 +70,17 @@ class MCDiscordBot(commands.Bot):
     def _log_stream_loop(self):
         # blocking docker log stream running in a thread
         while True:
-            try:
-                if not self.container:
-                    try:
-                        self.container = self.docker_client.containers.get(Config.CONTAINER_NAME)
-                    except Exception:
-                        asyncio.run_coroutine_threadsafe(self._notify_channel(f"⚠️ コンテナ `{Config.CONTAINER_NAME}` を取得できませんでした。"), self.loop)
-                        time.sleep(10)
-                        continue
-
+            # attempt to ensure container reference
+            if not self.container:
+                try:
+                    self.container = self.docker_client.containers.get(Config.CONTAINER_NAME)
+                except Exception:
+                    asyncio.run_coroutine_threadsafe(self._notify_channel(f"⚠️ コンテナ `{Config.CONTAINER_NAME}` を取得できませんでした。"), self.loop)
+                    time.sleep(5)
+                    continue
+                    # try streaming logs with exponential backoff on failures
+            backoff = 1
+            while True:
                 try:
                     try:
                         since_ts = int(time.time())
@@ -86,17 +94,47 @@ class MCDiscordBot(commands.Bot):
                         except Exception:
                             line = str(raw)
                         self._handle_log_line(line)
+                    # if logs iterator ends normally, break to re-resolve
+                    break
                 except docker.errors.NotFound as e:
                     logger.warning(f"Container disappeared, will re-resolve: {e}")
                     self.container = None
                     time.sleep(2)
-                    continue
-                except Exception as e:
+                    break
+                except Exception:
                     logger.exception("Log stream error")
-                    time.sleep(5)
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 30)
+                    continue
             except Exception as e:
                 logger.exception("Log stream error")
                 time.sleep(5)
+
+    def _docker_events_loop(self):
+        # listen to docker events and react to container lifecycle
+        try:
+            for event in self.docker_client.events(decode=True):
+                try:
+                    actor = event.get('Actor', {})
+                    attrs = actor.get('Attributes', {})
+                    name = attrs.get('name')
+                    status = event.get('status')
+                    if name != Config.CONTAINER_NAME:
+                        continue
+                    if status in ('start', 'restart'):
+                        asyncio.run_coroutine_threadsafe(self._notify_channel(f"🟢 サーバーコンテナ `{name}` が起動しました"), self.loop)
+                        try:
+                            self.container = self.docker_client.containers.get(Config.CONTAINER_NAME)
+                            self.start_log_thread()
+                        except Exception:
+                            logger.warning("Failed to re-resolve container after start event")
+                    elif status in ('die', 'stop', 'destroy'):
+                        asyncio.run_coroutine_threadsafe(self._notify_channel(f"🔴 サーバーコンテナ `{name}` が停止しました"), self.loop)
+                        self.container = None
+                except Exception:
+                    logger.exception("Error handling docker event")
+        except Exception:
+            logger.exception("Docker events loop terminated")
 
     def _handle_log_line(self, line: str):
         logger.debug(line.strip())
@@ -162,6 +200,25 @@ def build_presence(status: str, player_count: Optional[int] = None) -> discord.A
     return discord.Activity(type=discord.ActivityType.playing, name="⚪ 状態不明")
 
 
+def rcon_execute_with_retries(command: str, retries: int = 4, return_result: bool = False, timeout: int = 5):
+    delay = 1
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            with MCRcon(Config.RCON_HOST, Config.RCON_PASSWORD, port=Config.RCON_PORT) as m:
+                res = m.command(command)
+                if return_result:
+                    return res
+                return None
+        except Exception as e:
+            last_exc = e
+            logger.warning(f"RCON attempt {attempt+1} failed: {e}")
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+            continue
+    raise last_exc
+
+
 bot = MCDiscordBot()
 
 mc = app_commands.Group(name="mc", description="Minecraft server controls")
@@ -217,15 +274,34 @@ async def mc_restart(interaction: discord.Interaction):
         container = bot.docker_client.containers.get(Config.CONTAINER_NAME)
         if container.status == 'running':
             try:
-                with MCRcon(Config.RCON_HOST, Config.RCON_PASSWORD, port=Config.RCON_PORT) as m:
-                    m.command('say サーバーを再起動します。数秒後に切断されます。')
-                    m.command('save-all')
+                rcon_execute_with_retries('say サーバーを再起動します。数秒後に切断されます。')
+                rcon_execute_with_retries('save-all')
             except Exception as e:
                 logger.warning(f"RCON announce/save failed: {e}")
         container.restart()
         await interaction.followup.send("サーバーを再起動しました。", ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"再起動に失敗しました: {e}", ephemeral=True)
+
+
+@mc.command(name="simulate", description="Simulate a log event for testing (join/leave/ready)")
+async def mc_simulate(interaction: discord.Interaction, event: str, player: str = ""):
+    await interaction.response.defer(ephemeral=True)
+    if not bot.has_admin(interaction):
+        await interaction.followup.send("権限がありません。", ephemeral=True)
+        return
+    if event not in ("join", "leave", "ready"):
+        await interaction.followup.send("event は join|leave|ready のいずれかを指定してください。", ephemeral=True)
+        return
+    if event == "join":
+        line = f"{player} joined the game"
+    elif event == "leave":
+        line = f"{player} left the game"
+    else:
+        line = 'Done'
+    # call handler directly
+    bot._handle_log_line(line)
+    await interaction.followup.send(f"Simulated: {line}", ephemeral=True)
 
 
 @mc.command(name="status", description="Show server status and players")
@@ -241,16 +317,15 @@ async def mc_status(interaction: discord.Interaction):
     player_list = "(不明)"
     player_count = 0
     try:
-        with MCRcon(Config.RCON_HOST, Config.RCON_PASSWORD, port=Config.RCON_PORT) as m:
-            r = m.command('list')
-            # parse: "There are X of a max of Y players online: name1, name2"
-            mres = re.search(r"There are (\d+) of a max of (\d+) players online:?\s*(.*)", r)
-            if mres:
-                player_count = int(mres.group(1))
-                names = mres.group(3).strip()
-                player_list = names if names else "(なし)"
-            else:
-                player_list = r
+        r = rcon_execute_with_retries('list', return_result=True)
+        # parse: "There are X of a max of Y players online: name1, name2"
+        mres = re.search(r"There are (\d+) of a max of (\d+) players online:?\s*(.*)", r)
+        if mres:
+            player_count = int(mres.group(1))
+            names = mres.group(3).strip()
+            player_list = names if names else "(なし)"
+        else:
+            player_list = r
     except Exception as e:
         logger.warning(f"RCON list failed: {e}")
 
