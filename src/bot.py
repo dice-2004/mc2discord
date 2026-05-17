@@ -106,9 +106,6 @@ class MCDiscordBot(commands.Bot):
                     time.sleep(backoff)
                     backoff = min(backoff * 2, 30)
                     continue
-            except Exception as e:
-                logger.exception("Log stream error")
-                time.sleep(5)
 
     def _docker_events_loop(self):
         # listen to docker events and react to container lifecycle
