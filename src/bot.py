@@ -74,16 +74,26 @@ class MCDiscordBot(commands.Bot):
                         continue
 
                 try:
-                    since_ts = int(time.time())
-                    logs = self.container.logs(stream=True, follow=True, since=since_ts)
-                except docker.errors.InvalidArgument:
-                    logs = self.container.logs(stream=True, follow=True)
-                for raw in logs:
                     try:
-                        line = raw.decode('utf-8', errors='ignore')
-                    except Exception:
-                        line = str(raw)
-                    self._handle_log_line(line)
+                        since_ts = int(time.time())
+                        logs = self.container.logs(stream=True, follow=True, since=since_ts)
+                    except docker.errors.InvalidArgument:
+                        logs = self.container.logs(stream=True, follow=True)
+
+                    for raw in logs:
+                        try:
+                            line = raw.decode('utf-8', errors='ignore')
+                        except Exception:
+                            line = str(raw)
+                        self._handle_log_line(line)
+                except docker.errors.NotFound as e:
+                    logger.warning(f"Container disappeared, will re-resolve: {e}")
+                    self.container = None
+                    time.sleep(2)
+                    continue
+                except Exception as e:
+                    logger.exception("Log stream error")
+                    time.sleep(5)
             except Exception as e:
                 logger.exception("Log stream error")
                 time.sleep(5)
