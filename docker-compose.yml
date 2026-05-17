@@ -1,0 +1,16 @@
+version: "3.8"
+services:
+  mc2discord:
+    build: .
+    container_name: mc2discord_bot
+    env_file:
+      - .env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
+    networks:
+      - mc2discord_net
+
+networks:
+  mc2discord_net:
+    driver: bridge
