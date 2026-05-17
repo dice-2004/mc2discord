@@ -33,6 +33,7 @@ class MCDiscordBot(commands.Bot):
         self.log_thread: Optional[threading.Thread] = None
         self.event_thread: Optional[threading.Thread] = None
         self.loop_ready = asyncio.Event()
+        self.last_players: set[str] = set()
 
     async def setup_hook(self):
         # register commands to guild if provided for faster registration
@@ -50,6 +51,8 @@ class MCDiscordBot(commands.Bot):
         self.loop_ready.set()
         if not status_updater.is_running():
             status_updater.start()
+        if not player_notifier.is_running():
+            player_notifier.start()
         # start docker events watcher
         if not (self.event_thread and self.event_thread.is_alive()):
             et = threading.Thread(target=self._docker_events_loop, daemon=True)
@@ -212,6 +215,18 @@ def build_presence(status: str, player_count: Optional[int] = None) -> discord.A
     if status in ('exited', 'dead'):
         return discord.Activity(type=discord.ActivityType.playing, name="🔴 停止中")
     return discord.Activity(type=discord.ActivityType.playing, name="⚪ 状態不明")
+
+
+def parse_rcon_player_names(list_response: str) -> set[str]:
+    # Example: There are 2 of a max of 20 players online: Steve, Alex
+    m = re.search(r"There are\s+(\d+)\s+of a max of\s+\d+\s+players online:?\s*(.*)", list_response)
+    if not m:
+        return set()
+    count = int(m.group(1))
+    names_part = (m.group(2) or "").strip()
+    if count == 0 or not names_part:
+        return set()
+    return {n.strip() for n in names_part.split(',') if n.strip()}
 
 
 def build_rcon_candidates() -> list[tuple[str, int]]:
@@ -459,6 +474,32 @@ async def status_updater():
         await bot.change_presence(activity=activity)
     except Exception:
         logger.exception("Failed to update presence")
+
+
+@tasks.loop(seconds=Config.PLAYER_NOTIFY_INTERVAL)
+async def player_notifier():
+    # Root-cause fix: detect join/leave via RCON list diff instead of fragile log parsing.
+    if not bot.is_ready() or bot.ws is None:
+        return
+
+    try:
+        loop = asyncio.get_running_loop()
+        r = await loop.run_in_executor(process_pool, partial(rcon_execute_with_retries, 'list', return_result=True))
+        if not isinstance(r, str):
+            return
+
+        current_players = parse_rcon_player_names(r)
+        joined = current_players - bot.last_players
+        left = bot.last_players - current_players
+
+        for name in sorted(joined):
+            await bot._notify_channel(f"🟢 `{name}` がサーバーに参加しました")
+        for name in sorted(left):
+            await bot._notify_channel(f"🔴 `{name}` がサーバーから退出しました")
+
+        bot.last_players = current_players
+    except Exception as e:
+        logger.warning(f"player_notifier failed: {e}")
 
 
 async def main():

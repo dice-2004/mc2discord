@@ -12,3 +12,4 @@ class Config:
     RCON_PASSWORD = os.getenv("RCON_PASSWORD")
 
     STATUS_UPDATE_INTERVAL = int(os.getenv("STATUS_UPDATE_INTERVAL", 60))
+    PLAYER_NOTIFY_INTERVAL = int(os.getenv("PLAYER_NOTIFY_INTERVAL", 8))
