@@ -3,8 +3,9 @@ import threading
 import asyncio
 import logging
 import time
+import os
 from typing import Optional
-from typing import Tuple, Optional
+from functools import partial
 
 import docker
 from concurrent.futures import ProcessPoolExecutor
@@ -199,57 +200,79 @@ def build_presence(status: str, player_count: Optional[int] = None) -> discord.A
     return discord.Activity(type=discord.ActivityType.playing, name="⚪ 状態不明")
 
 
+def build_rcon_candidates() -> list[tuple[str, int]]:
+    """Build deterministic RCON endpoints from Docker metadata.
+
+    Preference:
+    1) target container IP on a network shared with this bot container
+    2) target container DNS name (only when a shared network exists)
+    3) host-published port reachable from container (host.docker.internal / gateway)
+    4) explicit env fallback (RCON_HOST:RCON_PORT)
+    """
+    candidates: list[tuple[str, int]] = []
+    bot_networks = {}
+
+    try:
+        client = docker.from_env()
+        target = client.containers.get(Config.CONTAINER_NAME)
+        target_networks = target.attrs.get('NetworkSettings', {}).get('Networks', {})
+
+        bot_container_id = os.getenv("HOSTNAME")
+        if bot_container_id:
+            try:
+                bot_container = client.containers.get(bot_container_id)
+                bot_networks = bot_container.attrs.get('NetworkSettings', {}).get('Networks', {})
+            except Exception:
+                bot_networks = {}
+
+        shared_network = None
+        for net_name in target_networks:
+            if net_name in bot_networks:
+                shared_network = net_name
+                break
+
+        if shared_network:
+            shared_ip = target_networks.get(shared_network, {}).get('IPAddress')
+            if shared_ip:
+                candidates.append((shared_ip, Config.RCON_PORT))
+            candidates.append((Config.CONTAINER_NAME, Config.RCON_PORT))
+
+        ports = target.attrs.get('NetworkSettings', {}).get('Ports', {})
+        key = f"{Config.RCON_PORT}/tcp"
+        if key in ports and ports[key]:
+            host_ip = ports[key][0].get('HostIp')
+            host_port = int(ports[key][0].get('HostPort'))
+            if host_ip and host_ip not in ('0.0.0.0', '::'):
+                candidates.append((host_ip, host_port))
+            candidates.append(('host.docker.internal', host_port))
+            for net in bot_networks.values():
+                gw = net.get('Gateway')
+                if gw:
+                    candidates.append((gw, host_port))
+    except Exception:
+        pass
+
+    candidates.append((Config.RCON_HOST, Config.RCON_PORT))
+
+    uniq: list[tuple[str, int]] = []
+    seen = set()
+    for host, port in candidates:
+        k = (host, port)
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append((host, port))
+    return uniq
+
+
 def rcon_execute_with_retries(command: str, retries: int = 4, return_result: bool = False, timeout: int = 5):
     delay = 1
     last_exc = None
     for attempt in range(retries):
-        # build candidate hosts in preferred order: container name, published host:port, container IP, configured host
-        candidates = []
-        # try container name (DNS within compose network)
-        candidates.append((Config.CONTAINER_NAME, Config.RCON_PORT))
-        # try to inspect container for published port or network IP
-        try:
-            container = docker.from_env().containers.get(Config.CONTAINER_NAME)
-            ports = container.attrs.get('NetworkSettings', {}).get('Ports', {})
-            key = f"{Config.RCON_PORT}/tcp"
-            if key in ports and ports[key]:
-                host_ip = ports[key][0].get('HostIp')
-                host_port = int(ports[key][0].get('HostPort'))
-                # 0.0.0.0/:: are bind addresses, not routable destinations from container
-                if host_ip and host_ip not in ('0.0.0.0', '::'):
-                    candidates.append((host_ip, host_port))
-                # fallback to host-gateway mapping for Linux Docker
-                candidates.append(('host.docker.internal', host_port))
-            networks = container.attrs.get('NetworkSettings', {}).get('Networks', {})
-            if networks:
-                first = next(iter(networks.values()))
-                ip = first.get('IPAddress')
-                if ip:
-                    candidates.append((ip, Config.RCON_PORT))
-                gw = first.get('Gateway')
-                if gw:
-                    candidates.append((gw, Config.RCON_PORT))
-        except Exception:
-            # ignore; will try configured host below
-            pass
-
-        # finally try configured RCON_HOST (may be hostname or ip)
-        candidates.append((Config.RCON_HOST, Config.RCON_PORT))
-
-        # de-duplicate while preserving order
-        uniq_candidates = []
-        seen = set()
-        for host, port in candidates:
-            key = (host, port)
-            if key in seen:
-                continue
-            seen.add(key)
-            uniq_candidates.append((host, port))
-
-        for host, port in uniq_candidates:
+        for host, port in build_rcon_candidates():
             try:
                 logger.info(f"RCON try connecting to {host}:{port} (attempt {attempt+1})")
-                with MCRcon(host, Config.RCON_PASSWORD, port=port) as m:
+                with MCRcon(host, Config.RCON_PASSWORD, port=port, timeout=timeout) as m:
                     res = m.command(command)
                     if return_result:
                         return res
@@ -306,7 +329,7 @@ async def mc_stop(interaction: discord.Interaction):
         # run save-all via RCON (offload blocking call to separate process)
         try:
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(process_pool, rcon_execute_with_retries, 'save-all')
+            await loop.run_in_executor(process_pool, partial(rcon_execute_with_retries, 'save-all'))
         except Exception as e:
             logger.warning(f"RCON save-all failed: {e}")
         container.stop()
@@ -326,8 +349,8 @@ async def mc_restart(interaction: discord.Interaction):
         if container.status == 'running':
             try:
                 loop = asyncio.get_running_loop()
-                await loop.run_in_executor(process_pool, rcon_execute_with_retries, 'say サーバーを再起動します。数秒後に切断されます。')
-                await loop.run_in_executor(process_pool, rcon_execute_with_retries, 'save-all')
+                await loop.run_in_executor(process_pool, partial(rcon_execute_with_retries, 'say サーバーを再起動します。数秒後に切断されます。'))
+                await loop.run_in_executor(process_pool, partial(rcon_execute_with_retries, 'save-all'))
             except Exception as e:
                 logger.warning(f"RCON announce/save failed: {e}")
         container.restart()
@@ -370,7 +393,9 @@ async def mc_status(interaction: discord.Interaction):
     player_count = 0
     try:
         loop = asyncio.get_running_loop()
-        r = await loop.run_in_executor(process_pool, rcon_execute_with_retries, 'list', True)
+        r = await loop.run_in_executor(process_pool, partial(rcon_execute_with_retries, 'list', return_result=True))
+        if not isinstance(r, str):
+            raise RuntimeError(f"unexpected RCON response type: {type(r)}")
         # parse: "There are X of a max of Y players online: name1, name2"
         mres = re.search(r"There are (\d+) of a max of (\d+) players online:?\s*(.*)", r)
         if mres:
@@ -405,7 +430,9 @@ async def status_updater():
     player_count = None
     try:
         loop = asyncio.get_running_loop()
-        r = await loop.run_in_executor(process_pool, rcon_execute_with_retries, 'list', True)
+        r = await loop.run_in_executor(process_pool, partial(rcon_execute_with_retries, 'list', return_result=True))
+        if not isinstance(r, str):
+            raise RuntimeError(f"unexpected RCON response type: {type(r)}")
         mres = re.search(r"There are (\d+) of a max of (\d+) players online", r)
         if mres:
             player_count = int(mres.group(1))
