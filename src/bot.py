@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 from typing import Optional
+from typing import Tuple, Optional
 
 import docker
 from mcrcon import MCRcon
@@ -173,11 +174,11 @@ class MCDiscordBot(commands.Bot):
 
 
 def parse_player_event(line: str) -> Optional[tuple[str, str]]:
-    joined = re.search(r"(\w+) joined the game", line)
+    joined = re.search(r"([^\s]+) joined the game", line)
     if joined:
         return joined.group(1), "join"
 
-    left = re.search(r"(\w+) left the game", line)
+    left = re.search(r"([^\s]+) left the game", line)
     if left:
         return left.group(1), "leave"
 
@@ -201,18 +202,49 @@ def rcon_execute_with_retries(command: str, retries: int = 4, return_result: boo
     delay = 1
     last_exc = None
     for attempt in range(retries):
+        # build candidate hosts in preferred order: container name, published host:port, container IP, configured host
+        candidates = []
+        # try container name (DNS within compose network)
+        candidates.append((Config.CONTAINER_NAME, Config.RCON_PORT))
+        # try to inspect container for published port or network IP
         try:
-            with MCRcon(Config.RCON_HOST, Config.RCON_PASSWORD, port=Config.RCON_PORT) as m:
-                res = m.command(command)
-                if return_result:
-                    return res
-                return None
-        except Exception as e:
-            last_exc = e
-            logger.warning(f"RCON attempt {attempt+1} failed: {e}")
-            time.sleep(delay)
-            delay = min(delay * 2, 30)
-            continue
+            container = docker.from_env().containers.get(Config.CONTAINER_NAME)
+            ports = container.attrs.get('NetworkSettings', {}).get('Ports', {})
+            key = f"{Config.RCON_PORT}/tcp"
+            if key in ports and ports[key]:
+                host_ip = ports[key][0].get('HostIp')
+                host_port = int(ports[key][0].get('HostPort'))
+                candidates.append((host_ip, host_port))
+            networks = container.attrs.get('NetworkSettings', {}).get('Networks', {})
+            if networks:
+                first = next(iter(networks.values()))
+                ip = first.get('IPAddress')
+                if ip:
+                    candidates.append((ip, Config.RCON_PORT))
+        except Exception:
+            # ignore; will try configured host below
+            pass
+
+        # finally try configured RCON_HOST (may be hostname or ip)
+        candidates.append((Config.RCON_HOST, Config.RCON_PORT))
+
+        for host, port in candidates:
+            try:
+                logger.info(f"RCON try connecting to {host}:{port} (attempt {attempt+1})")
+                with MCRcon(host, Config.RCON_PASSWORD, port=port) as m:
+                    res = m.command(command)
+                    if return_result:
+                        return res
+                    return None
+            except Exception as e:
+                last_exc = e
+                logger.warning(f"RCON host {host}:{port} attempt failed: {e}")
+                # try next candidate
+                continue
+
+        # if all candidates failed, wait and retry
+        time.sleep(delay)
+        delay = min(delay * 2, 30)
     raise last_exc
 
 
