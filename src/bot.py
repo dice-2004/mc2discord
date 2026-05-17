@@ -62,10 +62,6 @@ class MCDiscordBot(commands.Bot):
         except Exception as e:
             logger.warning(f"Could not get container {Config.CONTAINER_NAME}: {e}")
 
-
-# process pool for RCON calls (avoid signal() in non-main threads)
-process_pool = ProcessPoolExecutor(max_workers=2)
-
     def start_log_thread(self):
         if self.log_thread and self.log_thread.is_alive():
             return
@@ -251,6 +247,10 @@ def rcon_execute_with_retries(command: str, retries: int = 4, return_result: boo
         time.sleep(delay)
         delay = min(delay * 2, 30)
     raise last_exc
+
+
+# process pool for RCON calls (avoid signal() in non-main threads)
+process_pool = ProcessPoolExecutor(max_workers=2)
 
 
 bot = MCDiscordBot()
