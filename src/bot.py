@@ -215,13 +215,20 @@ def rcon_execute_with_retries(command: str, retries: int = 4, return_result: boo
             if key in ports and ports[key]:
                 host_ip = ports[key][0].get('HostIp')
                 host_port = int(ports[key][0].get('HostPort'))
-                candidates.append((host_ip, host_port))
+                # 0.0.0.0/:: are bind addresses, not routable destinations from container
+                if host_ip and host_ip not in ('0.0.0.0', '::'):
+                    candidates.append((host_ip, host_port))
+                # fallback to host-gateway mapping for Linux Docker
+                candidates.append(('host.docker.internal', host_port))
             networks = container.attrs.get('NetworkSettings', {}).get('Networks', {})
             if networks:
                 first = next(iter(networks.values()))
                 ip = first.get('IPAddress')
                 if ip:
                     candidates.append((ip, Config.RCON_PORT))
+                gw = first.get('Gateway')
+                if gw:
+                    candidates.append((gw, Config.RCON_PORT))
         except Exception:
             # ignore; will try configured host below
             pass
@@ -229,7 +236,17 @@ def rcon_execute_with_retries(command: str, retries: int = 4, return_result: boo
         # finally try configured RCON_HOST (may be hostname or ip)
         candidates.append((Config.RCON_HOST, Config.RCON_PORT))
 
+        # de-duplicate while preserving order
+        uniq_candidates = []
+        seen = set()
         for host, port in candidates:
+            key = (host, port)
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq_candidates.append((host, port))
+
+        for host, port in uniq_candidates:
             try:
                 logger.info(f"RCON try connecting to {host}:{port} (attempt {attempt+1})")
                 with MCRcon(host, Config.RCON_PASSWORD, port=port) as m:
