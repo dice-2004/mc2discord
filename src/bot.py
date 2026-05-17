@@ -281,10 +281,9 @@ async def mc_stop(interaction: discord.Interaction):
         if container.status != 'running':
             await interaction.followup.send("サーバーは稼働していません。", ephemeral=True)
             return
-        # run save-all via RCON
+        # run save-all via RCON (offload blocking call)
         try:
-            with MCRcon(Config.RCON_HOST, Config.RCON_PASSWORD, port=Config.RCON_PORT) as m:
-                m.command("save-all")
+            await asyncio.to_thread(rcon_execute_with_retries, 'save-all')
         except Exception as e:
             logger.warning(f"RCON save-all failed: {e}")
         container.stop()
@@ -303,8 +302,8 @@ async def mc_restart(interaction: discord.Interaction):
         container = bot.docker_client.containers.get(Config.CONTAINER_NAME)
         if container.status == 'running':
             try:
-                rcon_execute_with_retries('say サーバーを再起動します。数秒後に切断されます。')
-                rcon_execute_with_retries('save-all')
+                await asyncio.to_thread(rcon_execute_with_retries, 'say サーバーを再起動します。数秒後に切断されます。')
+                await asyncio.to_thread(rcon_execute_with_retries, 'save-all')
             except Exception as e:
                 logger.warning(f"RCON announce/save failed: {e}")
         container.restart()
@@ -346,7 +345,7 @@ async def mc_status(interaction: discord.Interaction):
     player_list = "(不明)"
     player_count = 0
     try:
-        r = rcon_execute_with_retries('list', return_result=True)
+        r = await asyncio.to_thread(rcon_execute_with_retries, 'list', True)
         # parse: "There are X of a max of Y players online: name1, name2"
         mres = re.search(r"There are (\d+) of a max of (\d+) players online:?\s*(.*)", r)
         if mres:
@@ -380,11 +379,10 @@ async def status_updater():
 
     player_count = None
     try:
-        with MCRcon(Config.RCON_HOST, Config.RCON_PASSWORD, port=Config.RCON_PORT) as m:
-            r = m.command('list')
-            mres = re.search(r"There are (\d+) of a max of (\d+) players online", r)
-            if mres:
-                player_count = int(mres.group(1))
+        r = await asyncio.to_thread(rcon_execute_with_retries, 'list', True)
+        mres = re.search(r"There are (\d+) of a max of (\d+) players online", r)
+        if mres:
+            player_count = int(mres.group(1))
     except Exception:
         pass
 
