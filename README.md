@@ -10,7 +10,12 @@ Minecraft サーバーを Docker 環境で管理するための Discord Bot
 - `/mc start` `/mc stop` `/mc restart` `/mc status` のスラッシュコマンド
 - RCON を用いた `save-all` や `say` 実行
 - コンテナのログストリーム監視による入退室通知
+- チャット、実績解除、死亡ログなどの Minecraft ログ転送
 - Bot ステータスに稼働状態とプレイヤー数を表示
+
+ログ転送の設定:
+- Minecraft のチャットや実績解除、死亡ログなどは、既存の `CHANNEL_ID` に転送します。
+- `FORWARD_ALL_LOG_LINES=true` にすると、上記以外の Minecraft ログもできるだけ転送します。
 
 セットアップ:
 1. リポジトリをクローン

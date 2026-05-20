@@ -13,3 +13,4 @@ class Config:
 
     STATUS_UPDATE_INTERVAL = int(os.getenv("STATUS_UPDATE_INTERVAL", 60))
     PLAYER_NOTIFY_INTERVAL = int(os.getenv("PLAYER_NOTIFY_INTERVAL", 8))
+    FORWARD_ALL_LOG_LINES = os.getenv("FORWARD_ALL_LOG_LINES", "false").lower() in ("1", "true", "yes", "on")

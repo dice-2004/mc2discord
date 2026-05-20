@@ -154,15 +154,26 @@ class MCDiscordBot(commands.Bot):
 
         if is_server_ready_line(line):
             asyncio.run_coroutine_threadsafe(self._notify_channel("✅ サーバーの起動が完了しました。"), self.loop)
+            return
+
+        relay_message = classify_relayable_log_line(line)
+        if relay_message:
+            asyncio.run_coroutine_threadsafe(self._notify_log_channel(relay_message), self.loop)
 
     async def _notify_channel(self, message: str):
-        if not Config.CHANNEL_ID:
+        await self._send_message_to_channel(Config.CHANNEL_ID, message)
+
+    async def _notify_log_channel(self, message: str):
+        await self._send_message_to_channel(Config.CHANNEL_ID, message)
+
+    async def _send_message_to_channel(self, channel_id: Optional[int], message: str):
+        if not channel_id:
             logger.warning("CHANNEL_ID not set, cannot send message")
             return
-        channel = self.get_channel(Config.CHANNEL_ID)
+        channel = self.get_channel(channel_id)
         if not channel:
             try:
-                channel = await self.fetch_channel(Config.CHANNEL_ID)
+                channel = await self.fetch_channel(channel_id)
             except Exception as e:
                 logger.warning(f"Cannot fetch channel: {e}")
                 return
@@ -215,6 +226,56 @@ def build_presence(status: str, player_count: Optional[int] = None) -> discord.A
     if status in ('exited', 'dead'):
         return discord.Activity(type=discord.ActivityType.playing, name="🔴 停止中")
     return discord.Activity(type=discord.ActivityType.playing, name="⚪ 状態不明")
+
+
+def strip_minecraft_log_prefix(line: str) -> str:
+    cleaned = re.sub(r"^\[[0-9:.,]+\]\s*\[[^\]]+\]:\s*", "", line)
+    cleaned = re.sub(r"^\[[^\]]+\]:\s*", "", cleaned)
+    return cleaned.strip()
+
+
+def truncate_for_discord(text: str, limit: int = 1800) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def classify_relayable_log_line(line: str) -> Optional[str]:
+    cleaned = strip_minecraft_log_prefix(line)
+    if not cleaned:
+        return None
+
+    if parse_player_event(cleaned) or is_server_ready_line(cleaned):
+        return None
+
+    chat = re.search(r"^<([^>]+)>\s+(.+)$", cleaned)
+    if chat:
+        player = chat.group(1)
+        message = chat.group(2).strip()
+        return truncate_for_discord(f"💬 `{player}`: {message}")
+
+    advancement = re.search(
+        r"^([^\s].*?)\s+(?:has\s+)?(?:made|completed|reached)\s+the\s+(?:advancement|challenge)\s+\[(.+?)\]$",
+        cleaned,
+        re.IGNORECASE,
+    )
+    if advancement:
+        player = advancement.group(1).strip()
+        title = advancement.group(2).strip()
+        return truncate_for_discord(f"🏆 `{player}` が実績 `{title}` を解除しました")
+
+    death = re.search(
+        r"^([^\s].*?)\s+(was|fell|drowned|burned|burnt|blown up|shot|slain|killed|froze|suffocated|impaled|hit|tried)\b.*$",
+        cleaned,
+        re.IGNORECASE,
+    )
+    if death and any(word in cleaned.lower() for word in (" was ", " fell ", " drowned", " burned", " burnt", " blown up", " shot", " slain", " killed", " froze", " suffocated", " impaled", " hit the ground", " tried to swim in lava")):
+        return truncate_for_discord(f"☠️ `{cleaned}`")
+
+    if Config.FORWARD_ALL_LOG_LINES:
+        return truncate_for_discord(f"📝 {cleaned}")
+
+    return None
 
 
 def parse_rcon_player_names(list_response: str) -> set[str]:
